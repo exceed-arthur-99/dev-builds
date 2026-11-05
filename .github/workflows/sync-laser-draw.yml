@@ -1,0 +1,59 @@
+name: Sync Laser Draw signed APKs to GitHub Releases
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-laser-draw-builds
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Retrieve and verify both upstream signed APKs
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view builds --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qx 'laser-draw-0.2.0.apk' &&
+             gh release view builds --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qx 'laser-draw-tv-0.2.0.apk'; then
+            echo "Both versioned APKs are already published; no further upload needed." >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          source_url="https://laser.exceed-io.com/builds"
+          # On a fresh release CodePipeline may still be building. Retry next hour.
+          if ! curl -fLsS --retry 3 --retry-delay 10 -o laser-draw-0.2.0.apk "$source_url/laser-draw-0.2.0.apk"; then
+            echo "CodeBuild APKs are not online yet; retry at next schedule." >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fLsS --retry 3 --retry-delay 10 -o laser-draw-tv-0.2.0.apk "$source_url/laser-draw-tv-0.2.0.apk"
+          curl -fLsS --retry 3 --retry-delay 10 -o upstream.sha256 "$source_url/laser-draw-0.2.0.sha256"
+          test -s laser-draw-0.2.0.apk
+          test -s laser-draw-tv-0.2.0.apk
+          unzip -tqq laser-draw-0.2.0.apk
+          unzip -tqq laser-draw-tv-0.2.0.apk
+          phone_expected="$(grep -F 'apps/android/app/build/outputs/apk/release/app-release.apk' upstream.sha256 | awk '{print $1}')"
+          tv_expected="$(grep -F 'apps/android/tv/build/outputs/apk/release/tv-release.apk' upstream.sha256 | awk '{print $1}')"
+          test -n "$phone_expected" && test -n "$tv_expected"
+          test "$phone_expected" = "$(sha256sum laser-draw-0.2.0.apk | awk '{print $1}')"
+          test "$tv_expected" = "$(sha256sum laser-draw-tv-0.2.0.apk | awk '{print $1}')"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Upload matching APKs to existing builds release
+        if: steps.fetch.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload builds --repo "$GITHUB_REPOSITORY" --clobber             laser-draw-0.2.0.apk laser-draw-tv-0.2.0.apk
+          echo "Published verified v0.2.0 phone and Fire TV APKs in the public builds release." >> "$GITHUB_STEP_SUMMARY"
